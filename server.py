@@ -7,43 +7,42 @@ from email.mime.multipart import MIMEMultipart
 
 app = Flask(__name__)
 
-# ─── CORS — lock to your domain only ─────────────────────────
-CORS(app, origins=[
-    "https://duskz.shop",
-    "https://www.duskz.shop"
-])
+CORS(app, origins=["https://duskz.shop", "https://www.duskz.shop"])
 
-# ─── CONFIG — ALL from environment variables, NO fallback defaults ────────────
-def require_env(name: str) -> str:
-    """Load env var or crash at startup — never silently use a default."""
-    value = os.environ.get(name, "").strip()
-    if not value:
-        raise RuntimeError(f"[STARTUP] Required environment variable '{name}' is not set. "
-                           f"Set it in Railway → Variables before deploying.")
-    return value
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+# STRIPE — required
+STRIPE_SECRET_KEY     = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 
-STRIPE_SECRET_KEY     = require_env("STRIPE_SECRET_KEY")
-STRIPE_WEBHOOK_SECRET = require_env("STRIPE_WEBHOOK_SECRET")
-SMTP_HOST             = os.environ.get("SMTP_HOST", "mail.duskz.shop")
-SMTP_PORT             = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER             = require_env("SMTP_USER")
-SMTP_PASS             = require_env("SMTP_PASS")
-FROM_EMAIL            = f"Duskz <{SMTP_USER}>"
+if not STRIPE_SECRET_KEY:
+    raise RuntimeError("STRIPE_SECRET_KEY env var is not set. Add it in Railway → Variables.")
+if not STRIPE_WEBHOOK_SECRET:
+    raise RuntimeError("STRIPE_WEBHOOK_SECRET env var is not set. Add it in Railway → Variables.")
 
 stripe.api_key = STRIPE_SECRET_KEY
 
-# ─── Server-side price table — client NEVER sets the price ───────────────────
-PRODUCT_PRICES = {
-    "standard":  799,   # $7.99
-    "premium":   1099,  # $10.99
-    "crosshair": 199,   # $1.99
-}
+# SMTP — optional, emails disabled if not configured
+SMTP_HOST    = os.environ.get("SMTP_HOST", "mail.duskz.shop")
+SMTP_PORT    = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER    = os.environ.get("SMTP_USER", "")
+SMTP_PASS    = os.environ.get("SMTP_PASS", "")
+FROM_EMAIL   = f"Duskz <{SMTP_USER}>" if SMTP_USER else "Duskz <noreply@duskz.shop>"
+SMTP_ENABLED = bool(SMTP_USER and SMTP_PASS)
 
+if not SMTP_ENABLED:
+    print("[WARNING] SMTP_USER/SMTP_PASS not set — email delivery disabled until configured")
+
+# ─── SERVER-SIDE PRICE TABLE — client never sets price ────────────────────────
+PRODUCT_PRICES = {
+    "standard":  799,
+    "premium":   1099,
+    "crosshair": 199,
+}
 ALLOWED_PRODUCTS = set(PRODUCT_PRICES.keys())
 
 DB_FILE = "keys.json"
 
-# ─── DB ──────────────────────────────────────────────────────────────────────
+# ─── DB ───────────────────────────────────────────────────────────────────────
 def load_keys():
     if not os.path.exists(DB_FILE):
         return []
@@ -54,17 +53,18 @@ def save_keys(keys):
     with open(DB_FILE, "w") as f:
         json.dump(keys, f, indent=2)
 
-# ─── EMAIL ───────────────────────────────────────────────────────────────────
-def send_key_email(to_email: str, customer_name: str, product_type: str, key_str: str) -> bool:
+# ─── EMAIL ────────────────────────────────────────────────────────────────────
+def send_key_email(to_email, customer_name, product_type, key_str):
+    if not SMTP_ENABLED:
+        print(f"[EMAIL] SKIPPED (SMTP not configured) — key {key_str} sold to {to_email}")
+        return False
     try:
         product_name = "Duskz Premium" if product_type == "premium" else "Duskz Standard"
-
-        # Sanitize anything going into the email
         safe_name    = str(customer_name)[:100].replace("<", "&lt;").replace(">", "&gt;")
         safe_key     = str(key_str).replace("<", "&lt;").replace(">", "&gt;")
         safe_product = product_name.replace("<", "&lt;").replace(">", "&gt;")
 
-        msg = MIMEMultipart("alternative")
+        msg            = MIMEMultipart("alternative")
         msg["Subject"] = f"Your {safe_product} License Key - Duskz"
         msg["From"]    = FROM_EMAIL
         msg["To"]      = to_email
@@ -73,53 +73,48 @@ def send_key_email(to_email: str, customer_name: str, product_type: str, key_str
 <html>
 <head>
 <style>
-    body {{ font-family: Arial, sans-serif; background: #080808; color: #f0f0f0; margin: 0; padding: 0; }}
-    .container {{ max-width: 600px; margin: 0 auto; }}
-    .header {{ background: #111111; padding: 40px; text-align: center; border-bottom: 1px solid rgba(255,255,255,0.1); }}
-    .header h1 {{ color: #ffffff; font-size: 26px; margin: 0; letter-spacing: 3px; }}
-    .body {{ background: #111111; padding: 40px; }}
-    .key-box {{ background: #080808; border: 1px solid rgba(255,255,255,0.2); border-radius: 12px;
-                padding: 24px; text-align: center; margin: 24px 0; }}
-    .key-label {{ color: #666; font-size: 12px; margin-bottom: 10px; letter-spacing: 2px; text-transform: uppercase; }}
-    .key-value {{ color: #ffffff; font-size: 18px; font-weight: bold; letter-spacing: 2px; word-break: break-all; }}
-    .steps {{ background: #161616; border-radius: 12px; padding: 24px; margin: 24px 0; }}
-    .steps h3 {{ color: #ffffff; margin-top: 0; }}
-    .step {{ padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.05); color: #888; }}
-    .step:last-child {{ border-bottom: none; }}
-    .btn {{ display: inline-block; background: #ffffff; color: #000000; padding: 14px 32px;
-            border-radius: 8px; text-decoration: none; font-weight: bold; margin: 10px 5px; }}
-    .footer {{ background: #080808; padding: 24px; text-align: center; color: #555; font-size: 13px;
-               border-top: 1px solid rgba(255,255,255,0.05); }}
+  body {{ font-family: Arial, sans-serif; background: #080808; color: #f0f0f0; margin: 0; padding: 0; }}
+  .container {{ max-width: 600px; margin: 0 auto; }}
+  .header {{ background: #111; padding: 40px; text-align: center; border-bottom: 1px solid rgba(255,255,255,0.1); }}
+  .header h1 {{ color: #fff; font-size: 26px; margin: 0; letter-spacing: 3px; }}
+  .body {{ background: #111; padding: 40px; }}
+  .key-box {{ background: #080808; border: 1px solid rgba(255,255,255,0.2); border-radius: 12px; padding: 24px; text-align: center; margin: 24px 0; }}
+  .key-label {{ color: #666; font-size: 12px; margin-bottom: 10px; letter-spacing: 2px; text-transform: uppercase; }}
+  .key-value {{ color: #fff; font-size: 18px; font-weight: bold; letter-spacing: 2px; word-break: break-all; }}
+  .steps {{ background: #161616; border-radius: 12px; padding: 24px; margin: 24px 0; }}
+  .steps h3 {{ color: #fff; margin-top: 0; }}
+  .step {{ padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.05); color: #888; }}
+  .step:last-child {{ border-bottom: none; }}
+  .btn {{ display: inline-block; background: #fff; color: #000; padding: 14px 32px; border-radius: 8px; text-decoration: none; font-weight: bold; margin: 10px 5px; }}
+  .footer {{ background: #080808; padding: 24px; text-align: center; color: #555; font-size: 13px; }}
 </style>
 </head>
 <body>
 <div class="container">
-    <div class="header"><h1>DUSKZ</h1></div>
-    <div class="body">
-        <p>Hey {safe_name},</p>
-        <p>Thank you for purchasing <strong>{safe_product}</strong>. Here is your license key:</p>
-        <div class="key-box">
-            <div class="key-label">Your License Key</div>
-            <div class="key-value">{safe_key}</div>
-        </div>
-        <div class="steps">
-            <h3>Next Steps</h3>
-            <div class="step">1. Download Duskz from our Discord</div>
-            <div class="step">2. Run Duskz.exe as Administrator</div>
-            <div class="step">3. Enter your license key above</div>
-            <div class="step">4. Enjoy!</div>
-        </div>
-        <div style="text-align:center;margin-top:30px;">
-            <a href="https://discord.gg/u85uVGhMBF" class="btn">Join Discord</a>
-        </div>
-        <p style="color:#555;font-size:12px;margin-top:30px;">
-            Keep this email safe — your license key is tied to your HWID.
-        </p>
+  <div class="header"><h1>DUSKZ</h1></div>
+  <div class="body">
+    <p>Hey {safe_name},</p>
+    <p>Thank you for purchasing <strong>{safe_product}</strong>. Here is your license key:</p>
+    <div class="key-box">
+      <div class="key-label">Your License Key</div>
+      <div class="key-value">{safe_key}</div>
     </div>
-    <div class="footer">
-        <p>Duskz &mdash; Premium Roblox External</p>
-        <p>Questions? Join our <a href="https://discord.gg/u85uVGhMBF" style="color:#aaa;">Discord</a></p>
+    <div class="steps">
+      <h3>Next Steps</h3>
+      <div class="step">1. Download Duskz from our Discord</div>
+      <div class="step">2. Run Duskz.exe as Administrator</div>
+      <div class="step">3. Enter your license key above</div>
+      <div class="step">4. Enjoy!</div>
     </div>
+    <div style="text-align:center;margin-top:30px;">
+      <a href="https://discord.gg/u85uVGhMBF" class="btn">Join Discord</a>
+    </div>
+    <p style="color:#555;font-size:12px;margin-top:30px;">Keep this email safe — your license key is tied to your HWID.</p>
+  </div>
+  <div class="footer">
+    <p>Duskz &mdash; Premium Roblox External</p>
+    <p>Questions? Join our <a href="https://discord.gg/u85uVGhMBF" style="color:#aaa;">Discord</a></p>
+  </div>
 </div>
 </body>
 </html>"""
@@ -143,19 +138,16 @@ def get_keys():
 
 @app.route("/keys", methods=["POST"])
 def create_key():
-    data = request.json or {}
+    data     = request.json or {}
     key_str  = str(data.get("key", "")).strip()
     key_type = data.get("type", "standard")
-
     if not key_str:
         return jsonify({"error": "No key provided"}), 400
     if key_type not in ALLOWED_PRODUCTS:
         return jsonify({"error": "Invalid product type"}), 400
-
     keys = load_keys()
     if any(k["key"] == key_str for k in keys):
         return jsonify({"error": "Key already exists"}), 409
-
     new_key = {
         "id":      str(uuid.uuid4()),
         "key":     key_str,
@@ -217,10 +209,8 @@ def validate_key():
     data    = request.json or {}
     key_str = str(data.get("key", "")).strip()
     hwid    = str(data.get("hwid", "")).strip()
-
     if not key_str or not hwid:
         return jsonify({"valid": False, "reason": "Missing key or hwid"}), 400
-
     keys = load_keys()
     for k in keys:
         if k["key"] == key_str:
@@ -233,17 +223,17 @@ def validate_key():
                 k["status"] = "used"
                 save_keys(keys)
             return jsonify({"valid": True, "type": k["type"]})
-
     return jsonify({"valid": False, "reason": "Key not found"})
 
 # ─── STOCK ────────────────────────────────────────────────────────────────────
 @app.route("/stock", methods=["GET"])
 def get_stock():
-    keys             = load_keys()
-    standard_unused  = sum(1 for k in keys if k["type"] == "standard"  and k["status"] == "unused")
-    premium_unused   = sum(1 for k in keys if k["type"] == "premium"   and k["status"] == "unused")
-    crosshair_unused = sum(1 for k in keys if k["type"] == "crosshair" and k["status"] == "unused")
-    return jsonify({"standard": standard_unused, "premium": premium_unused, "crosshair": crosshair_unused})
+    keys = load_keys()
+    return jsonify({
+        "standard":  sum(1 for k in keys if k["type"] == "standard"  and k["status"] == "unused"),
+        "premium":   sum(1 for k in keys if k["type"] == "premium"   and k["status"] == "unused"),
+        "crosshair": sum(1 for k in keys if k["type"] == "crosshair" and k["status"] == "unused"),
+    })
 
 # ─── STRIPE: Create Payment Intent ───────────────────────────────────────────
 @app.route("/create-payment-intent", methods=["POST"])
@@ -254,18 +244,12 @@ def create_payment_intent():
         email   = str(data.get("email",   "")).strip()
         name    = str(data.get("name",    "Customer")).strip()[:100]
 
-        # Validate product against whitelist
         if product not in ALLOWED_PRODUCTS:
             return jsonify({"error": "Invalid product"}), 400
-
-        # Validate email server-side
         if not email or "@" not in email or len(email) > 254:
             return jsonify({"error": "Invalid email address"}), 400
 
-        # Price comes from server table — never from the client
-        amount = PRODUCT_PRICES[product]
-
-        # Check stock before charging
+        amount    = PRODUCT_PRICES[product]
         keys      = load_keys()
         available = [k for k in keys if k["type"] == product and k["status"] == "unused"]
         if not available:
@@ -275,11 +259,7 @@ def create_payment_intent():
             amount=amount,
             currency="usd",
             receipt_email=email,
-            metadata={
-                "product":        product,
-                "customer_name":  name,
-                "customer_email": email
-            }
+            metadata={"product": product, "customer_name": name, "customer_email": email}
         )
         return jsonify({"clientSecret": intent.client_secret})
 
@@ -287,7 +267,7 @@ def create_payment_intent():
         print(f"[STRIPE ERROR] {e}")
         return jsonify({"error": "Payment provider error. Please try again."}), 502
     except Exception as e:
-        print(f"[ERROR] create_payment_intent: {e}")
+        print(f"[ERROR] {e}")
         return jsonify({"error": "Internal server error"}), 500
 
 # ─── STRIPE: Webhook ─────────────────────────────────────────────────────────
@@ -295,12 +275,10 @@ def create_payment_intent():
 def stripe_webhook():
     payload    = request.data
     sig_header = request.headers.get("Stripe-Signature", "")
-
-    # ALWAYS verify signature — reject anything without a valid sig
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except stripe.error.SignatureVerificationError:
-        print("[WEBHOOK] Invalid signature — request rejected")
+        print("[WEBHOOK] Invalid signature — rejected")
         return jsonify({"error": "Invalid signature"}), 400
     except Exception as e:
         print(f"[WEBHOOK ERROR] {e}")
@@ -312,20 +290,16 @@ def stripe_webhook():
         product = pi["metadata"].get("product", "standard")
         name    = pi["metadata"].get("customer_name", "Customer")
 
-        # Validate product from metadata
         if product not in ALLOWED_PRODUCTS:
-            print(f"[WEBHOOK] Invalid product in metadata: {product}")
-            return jsonify({"status": "ok"})  # Return 200 so Stripe doesn't retry
+            print(f"[WEBHOOK] Invalid product: {product}")
+            return jsonify({"status": "ok"})
 
         keys      = load_keys()
         available = [k for k in keys if k["type"] == product and k["status"] == "unused"]
-
         if not available:
-            print(f"[WEBHOOK] CRITICAL: No {product} keys available for {email}!")
-            # TODO: alert yourself here (email/Discord webhook) for manual fulfillment
+            print(f"[WEBHOOK] CRITICAL: No {product} keys for {email} — manual fulfillment needed!")
             return jsonify({"status": "ok"})
 
-        # Mark key as sold
         chosen = available[0]
         for k in keys:
             if k["id"] == chosen["id"]:
@@ -336,8 +310,6 @@ def stripe_webhook():
 
         save_keys(keys)
         print(f"[WEBHOOK] Key {chosen['key']} sold to {email}")
-
-        # Send email
         send_key_email(email, name, product, chosen["key"])
 
     return jsonify({"status": "ok"})
@@ -345,38 +317,28 @@ def stripe_webhook():
 # ─── GET KEY FOR SUCCESS PAGE ─────────────────────────────────────────────────
 @app.route("/get-purchased-key", methods=["POST"])
 def get_purchased_key():
-    data               = request.json or {}
-    payment_intent_id  = str(data.get("payment_intent_id", "")).strip()
-
-    if not payment_intent_id:
-        return jsonify({"error": "Missing payment_intent_id"}), 400
-
-    # Basic format check — Stripe PI IDs always start with "pi_"
-    if not payment_intent_id.startswith("pi_"):
+    data              = request.json or {}
+    payment_intent_id = str(data.get("payment_intent_id", "")).strip()
+    if not payment_intent_id or not payment_intent_id.startswith("pi_"):
         return jsonify({"error": "Invalid payment intent ID"}), 400
-
     try:
         pi      = stripe.PaymentIntent.retrieve(payment_intent_id)
         email   = pi.get("receipt_email") or pi.metadata.get("customer_email", "")
         product = pi.metadata.get("product", "standard")
-
-        keys = load_keys()
+        keys    = load_keys()
         for k in keys:
             if k.get("email") == email and k["type"] == product and k["status"] == "sold":
                 return jsonify({"key": k["key"], "type": k["type"]})
-
         return jsonify({"error": "Key not found"}), 404
-
     except stripe.error.StripeError as e:
-        print(f"[STRIPE ERROR] get_purchased_key: {e}")
+        print(f"[STRIPE ERROR] {e}")
         return jsonify({"error": "Could not verify payment"}), 502
     except Exception as e:
-        print(f"[ERROR] get_purchased_key: {e}")
+        print(f"[ERROR] {e}")
         return jsonify({"error": "Internal server error"}), 500
 
 # ─── RUN ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("\n  DUSKZ Key Server v2.0")
     print("  Running on http://localhost:5000\n")
-    # debug=False always — never run debug=True in production
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
