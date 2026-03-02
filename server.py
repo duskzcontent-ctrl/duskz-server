@@ -9,14 +9,16 @@ from psycopg2.extras import RealDictCursor
 
 app = Flask(__name__)
 
-# ✅ CORS FIX (Netlify + Domain)
+# ✅ Allow Netlify + domain
 CORS(app, origins=[
+    "https://tranquil-crostata-149f15.netlify.app",
     "https://duskz.shop",
-    "https://www.duskz.shop",
-    "https://tranquil-crostata-149f15.netlify.app"
+    "https://www.duskz.shop"
 ])
 
-# ─── STRIPE CONFIG ─────────────────────────────────────
+# ─────────────────────────────────────
+# STRIPE
+# ─────────────────────────────────────
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 
@@ -25,7 +27,9 @@ if not STRIPE_SECRET_KEY or not STRIPE_WEBHOOK_SECRET:
 
 stripe.api_key = STRIPE_SECRET_KEY
 
-# ─── DATABASE (POSTGRES) ───────────────────────────────
+# ─────────────────────────────────────
+# DATABASE
+# ─────────────────────────────────────
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set")
@@ -52,45 +56,9 @@ def init_db():
 
 init_db()
 
-# ─── SMTP (OPTIONAL) ───────────────────────────────────
-SMTP_HOST = os.environ.get("SMTP_HOST", "mail.duskz.shop")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER = os.environ.get("SMTP_USER", "")
-SMTP_PASS = os.environ.get("SMTP_PASS", "")
-FROM_EMAIL = f"Duskz <{SMTP_USER}>" if SMTP_USER else "Duskz <noreply@duskz.shop>"
-SMTP_ENABLED = bool(SMTP_USER and SMTP_PASS)
-
-if not SMTP_ENABLED:
-    print("[INFO] Email disabled")
-
-def send_key_email(to_email, name, product, key):
-    if not SMTP_ENABLED:
-        print(f"[EMAIL] skipped for {to_email}")
-        return
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = "Your Duskz License Key"
-        msg["From"] = FROM_EMAIL
-        msg["To"] = to_email
-
-        html = f"""
-        <html><body style="font-family:Arial;background:#080808;color:#fff">
-        <h2>DUSKZ</h2>
-        <p>Hey {name},</p>
-        <p>Your license key:</p>
-        <pre style="background:#111;padding:12px;border-radius:6px">{key}</pre>
-        </body></html>
-        """
-        msg.attach(MIMEText(html, "html"))
-
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-            s.starttls()
-            s.login(SMTP_USER, SMTP_PASS)
-            s.sendmail(FROM_EMAIL, to_email, msg.as_string())
-    except Exception as e:
-        print("[EMAIL ERROR]", e)
-
-# ─── PRODUCTS ──────────────────────────────────────────
+# ─────────────────────────────────────
+# PRODUCTS
+# ─────────────────────────────────────
 PRODUCT_PRICES = {
     "standard": 799,
     "premium": 1099,
@@ -98,39 +66,63 @@ PRODUCT_PRICES = {
 }
 ALLOWED_PRODUCTS = set(PRODUCT_PRICES.keys())
 
-# ─── HEALTH CHECK ──────────────────────────────────────
+# ─────────────────────────────────────
+# HEALTH
+# ─────────────────────────────────────
 @app.route("/")
 def home():
     return {"status": "ok"}
 
-# ─── KEY ROUTES ────────────────────────────────────────
+# ─────────────────────────────────────
+# BULK KEY GENERATOR (FIXED)
+# ─────────────────────────────────────
+@app.route("/keys/generate", methods=["POST"])
+def generate_keys():
+    data = request.json or {}
+    amount = int(data.get("amount", 1))
+    type_ = data.get("type", "standard")
+
+    if type_ not in ALLOWED_PRODUCTS:
+        return jsonify({"error": "invalid type"}), 400
+
+    generated = []
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            for _ in range(amount):
+                new_key = str(uuid.uuid4()).upper()
+                cur.execute("""
+                    INSERT INTO keys (id, key, type, status, created)
+                    VALUES (%s,%s,%s,%s,%s)
+                """, (
+                    uuid.uuid4(),
+                    new_key,
+                    type_,
+                    "unused",
+                    datetime.utcnow()
+                ))
+                generated.append(new_key)
+        conn.commit()
+
+    return jsonify({
+        "success": True,
+        "generated": generated,
+        "count": len(generated)
+    })
+
+# ─────────────────────────────────────
+# LIST KEYS
+# ─────────────────────────────────────
 @app.route("/keys", methods=["GET"])
-def get_keys():
+def list_keys():
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM keys ORDER BY created DESC")
             return jsonify(cur.fetchall())
 
-@app.route("/keys", methods=["POST"])
-def create_key():
-    data = request.json or {}
-    key = data.get("key")
-    type_ = data.get("type", "standard")
-
-    if not key or type_ not in ALLOWED_PRODUCTS:
-        return jsonify({"error": "invalid"}), 400
-
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO keys (id, key, type, status, created)
-                VALUES (%s,%s,%s,%s,%s)
-                ON CONFLICT (key) DO NOTHING
-            """, (uuid.uuid4(), key, type_, "unused", datetime.utcnow()))
-        conn.commit()
-
-    return jsonify({"success": True})
-
+# ─────────────────────────────────────
+# VALIDATE KEY
+# ─────────────────────────────────────
 @app.route("/validate", methods=["POST"])
 def validate():
     data = request.json or {}
@@ -157,6 +149,9 @@ def validate():
 
             return jsonify({"valid": True, "type": k["type"]})
 
+# ─────────────────────────────────────
+# STRIPE PAYMENT INTENT
+# ─────────────────────────────────────
 @app.route("/create-payment-intent", methods=["POST"])
 def create_payment_intent():
     data = request.json or {}
@@ -180,6 +175,9 @@ def create_payment_intent():
 
     return jsonify({"clientSecret": intent.client_secret})
 
+# ─────────────────────────────────────
+# STRIPE WEBHOOK
+# ─────────────────────────────────────
 @app.route("/stripe-webhook", methods=["POST"])
 def stripe_webhook():
     payload = request.data
@@ -192,7 +190,6 @@ def stripe_webhook():
     if event["type"] == "payment_intent.succeeded":
         pi = event["data"]["object"]
         email = pi["metadata"]["customer_email"]
-        name = pi["metadata"]["customer_name"]
         product = pi["metadata"]["product"]
 
         with get_db() as conn:
@@ -214,10 +211,10 @@ def stripe_webhook():
                 """, (email, datetime.utcnow(), k["id"]))
             conn.commit()
 
-        send_key_email(email, name, product, k["key"])
-
     return jsonify({"status": "ok"})
 
-# ─── START ─────────────────────────────────────────────
+# ─────────────────────────────────────
+# START
+# ─────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
