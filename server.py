@@ -170,5 +170,43 @@ def delete_key(key):
     return jsonify({"success": True})
 
 # ─────────────────────────────────────
+# VALIDATE KEY (called by C++ loader)
+# ─────────────────────────────────────
+@app.route("/validate", methods=["POST"])
+def validate_key():
+    data = request.json or {}
+    key = data.get("key")
+    hwid = data.get("hwid")
+
+    if not key or not hwid:
+        return jsonify({"valid": False, "error": "Missing key or hwid"}), 400
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM keys WHERE key=%s", (key,))
+            record = cur.fetchone()
+
+    if not record:
+        return jsonify({"valid": False, "error": "Key not found"})
+
+    if record["status"] == "banned":
+        return jsonify({"valid": False, "error": "Key is banned"})
+
+    if record["hwid"] is None:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE keys SET hwid=%s, status='active' WHERE key=%s",
+                    (hwid, key)
+                )
+            conn.commit()
+        return jsonify({"valid": True, "type": record["type"]})
+
+    if record["hwid"] != hwid:
+        return jsonify({"valid": False, "error": "HWID mismatch"})
+
+    return jsonify({"valid": True, "type": record["type"]})
+
+# ─────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
