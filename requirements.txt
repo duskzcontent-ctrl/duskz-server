@@ -2,3 +2,4 @@ flask
 flask-cors
 stripe
 gunicorn
+psycopg2-binary
