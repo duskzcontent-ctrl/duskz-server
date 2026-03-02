@@ -1,35 +1,13 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import os, uuid, smtplib, stripe
+import os, uuid
 from datetime import datetime
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
 app = Flask(__name__)
+CORS(app)
 
-# ✅ Allow Netlify + domain
-CORS(app, origins=[
-    "https://tranquil-crostata-149f15.netlify.app",
-    "https://duskz.shop",
-    "https://www.duskz.shop"
-])
-
-# ─────────────────────────────────────
-# STRIPE
-# ─────────────────────────────────────
-STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
-STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
-
-if not STRIPE_SECRET_KEY or not STRIPE_WEBHOOK_SECRET:
-    raise RuntimeError("Stripe env vars missing")
-
-stripe.api_key = STRIPE_SECRET_KEY
-
-# ─────────────────────────────────────
-# DATABASE
-# ─────────────────────────────────────
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set")
@@ -47,9 +25,7 @@ def init_db():
                     type TEXT NOT NULL,
                     status TEXT NOT NULL,
                     hwid TEXT,
-                    email TEXT,
-                    created TIMESTAMP,
-                    sold_at TIMESTAMP
+                    created TIMESTAMP NOT NULL
                 )
             """)
         conn.commit()
@@ -57,164 +33,142 @@ def init_db():
 init_db()
 
 # ─────────────────────────────────────
-# PRODUCTS
-# ─────────────────────────────────────
-PRODUCT_PRICES = {
-    "standard": 799,
-    "premium": 1099,
-    "crosshair": 199,
-}
-ALLOWED_PRODUCTS = set(PRODUCT_PRICES.keys())
-
-# ─────────────────────────────────────
-# HEALTH
-# ─────────────────────────────────────
-@app.route("/")
-def home():
-    return {"status": "ok"}
-
-# ─────────────────────────────────────
-# BULK KEY GENERATOR (FIXED)
-# ─────────────────────────────────────
-@app.route("/keys/generate", methods=["POST"])
-def generate_keys():
-    data = request.json or {}
-    amount = int(data.get("amount", 1))
-    type_ = data.get("type", "standard")
-
-    if type_ not in ALLOWED_PRODUCTS:
-        return jsonify({"error": "invalid type"}), 400
-
-    generated = []
-
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            for _ in range(amount):
-                new_key = str(uuid.uuid4()).upper()
-                cur.execute("""
-                    INSERT INTO keys (id, key, type, status, created)
-                    VALUES (%s,%s,%s,%s,%s)
-                """, (
-                    uuid.uuid4(),
-                    new_key,
-                    type_,
-                    "unused",
-                    datetime.utcnow()
-                ))
-                generated.append(new_key)
-        conn.commit()
-
-    return jsonify({
-        "success": True,
-        "generated": generated,
-        "count": len(generated)
-    })
-
-# ─────────────────────────────────────
-# LIST KEYS
+# GET ALL KEYS
 # ─────────────────────────────────────
 @app.route("/keys", methods=["GET"])
-def list_keys():
+def get_keys():
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM keys ORDER BY created DESC")
             return jsonify(cur.fetchall())
 
 # ─────────────────────────────────────
-# VALIDATE KEY
+# CREATE KEY
 # ─────────────────────────────────────
-@app.route("/validate", methods=["POST"])
-def validate():
+@app.route("/keys", methods=["POST"])
+def create_key():
     data = request.json or {}
     key = data.get("key")
-    hwid = data.get("hwid")
+    type_ = data.get("type", "standard")
+
+    if not key:
+        return jsonify({"error": "Key required"}), 400
+
+    record = {
+        "id": str(uuid.uuid4()),
+        "key": key,
+        "type": type_,
+        "status": "unused",
+        "hwid": None,
+        "created": datetime.utcnow()
+    }
 
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM keys WHERE key=%s", (key,))
-            k = cur.fetchone()
+            cur.execute("""
+                INSERT INTO keys (id, key, type, status, hwid, created)
+                VALUES (%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (key) DO NOTHING
+                RETURNING *
+            """, (
+                record["id"],
+                record["key"],
+                record["type"],
+                record["status"],
+                record["hwid"],
+                record["created"]
+            ))
+            inserted = cur.fetchone()
+        conn.commit()
 
-            if not k or k["status"] == "banned":
-                return jsonify({"valid": False})
+    if not inserted:
+        return jsonify({"error": "Key already exists"}), 400
 
-            if k["hwid"] and k["hwid"] != hwid:
-                return jsonify({"valid": False})
-
-            if not k["hwid"]:
-                cur.execute(
-                    "UPDATE keys SET hwid=%s, status='used' WHERE key=%s",
-                    (hwid, key)
-                )
-                conn.commit()
-
-            return jsonify({"valid": True, "type": k["type"]})
-
-# ─────────────────────────────────────
-# STRIPE PAYMENT INTENT
-# ─────────────────────────────────────
-@app.route("/create-payment-intent", methods=["POST"])
-def create_payment_intent():
-    data = request.json or {}
-    product = data.get("product")
-    email = data.get("email")
-    name = data.get("name", "Customer")
-
-    if product not in ALLOWED_PRODUCTS:
-        return jsonify({"error": "invalid product"}), 400
-
-    intent = stripe.PaymentIntent.create(
-        amount=PRODUCT_PRICES[product],
-        currency="usd",
-        receipt_email=email,
-        metadata={
-            "product": product,
-            "customer_name": name,
-            "customer_email": email
-        }
-    )
-
-    return jsonify({"clientSecret": intent.client_secret})
+    return jsonify(inserted)
 
 # ─────────────────────────────────────
-# STRIPE WEBHOOK
+# RESET HWID
 # ─────────────────────────────────────
-@app.route("/stripe-webhook", methods=["POST"])
-def stripe_webhook():
-    payload = request.data
-    sig = request.headers.get("Stripe-Signature")
+@app.route("/keys/<key>/reset-hwid", methods=["POST"])
+def reset_hwid(key):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE keys
+                SET hwid=NULL, status='unused'
+                WHERE key=%s
+                RETURNING *
+            """, (key,))
+            updated = cur.fetchone()
+        conn.commit()
 
-    event = stripe.Webhook.construct_event(
-        payload, sig, STRIPE_WEBHOOK_SECRET
-    )
+    if not updated:
+        return jsonify({"error": "Key not found"}), 404
 
-    if event["type"] == "payment_intent.succeeded":
-        pi = event["data"]["object"]
-        email = pi["metadata"]["customer_email"]
-        product = pi["metadata"]["product"]
-
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT * FROM keys
-                    WHERE type=%s AND status='unused'
-                    LIMIT 1
-                """, (product,))
-                k = cur.fetchone()
-
-                if not k:
-                    return jsonify({"status": "no_keys_available"})
-
-                cur.execute("""
-                    UPDATE keys
-                    SET status='sold', email=%s, sold_at=%s
-                    WHERE id=%s
-                """, (email, datetime.utcnow(), k["id"]))
-            conn.commit()
-
-    return jsonify({"status": "ok"})
+    return jsonify(updated)
 
 # ─────────────────────────────────────
-# START
+# BAN
+# ─────────────────────────────────────
+@app.route("/keys/<key>/ban", methods=["POST"])
+def ban_key(key):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE keys
+                SET status='banned'
+                WHERE key=%s
+                RETURNING *
+            """, (key,))
+            updated = cur.fetchone()
+        conn.commit()
+
+    if not updated:
+        return jsonify({"error": "Key not found"}), 404
+
+    return jsonify(updated)
+
+# ─────────────────────────────────────
+# UNBAN
+# ─────────────────────────────────────
+@app.route("/keys/<key>/unban", methods=["POST"])
+def unban_key(key):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE keys
+                SET status='unused'
+                WHERE key=%s
+                RETURNING *
+            """, (key,))
+            updated = cur.fetchone()
+        conn.commit()
+
+    if not updated:
+        return jsonify({"error": "Key not found"}), 404
+
+    return jsonify(updated)
+
+# ─────────────────────────────────────
+# DELETE
+# ─────────────────────────────────────
+@app.route("/keys/<key>", methods=["DELETE"])
+def delete_key(key):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM keys
+                WHERE key=%s
+                RETURNING *
+            """, (key,))
+            deleted = cur.fetchone()
+        conn.commit()
+
+    if not deleted:
+        return jsonify({"error": "Key not found"}), 404
+
+    return jsonify({"success": True})
+
 # ─────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
