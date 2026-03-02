@@ -8,9 +8,15 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 app = Flask(__name__)
-CORS(app, origins=["https://duskz.shop", "https://www.duskz.shop"])
 
-# ─── STRIPE CONFIG ────────────────────────────────────────────────────────────
+# ✅ CORS FIX (Netlify + Domain)
+CORS(app, origins=[
+    "https://duskz.shop",
+    "https://www.duskz.shop",
+    "https://tranquil-crostata-149f15.netlify.app"
+])
+
+# ─── STRIPE CONFIG ─────────────────────────────────────
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 
@@ -19,7 +25,7 @@ if not STRIPE_SECRET_KEY or not STRIPE_WEBHOOK_SECRET:
 
 stripe.api_key = STRIPE_SECRET_KEY
 
-# ─── DATABASE (POSTGRES) ──────────────────────────────────────────────────────
+# ─── DATABASE (POSTGRES) ───────────────────────────────
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set")
@@ -46,7 +52,7 @@ def init_db():
 
 init_db()
 
-# ─── SMTP (OPTIONAL) ──────────────────────────────────────────────────────────
+# ─── SMTP (OPTIONAL) ───────────────────────────────────
 SMTP_HOST = os.environ.get("SMTP_HOST", "mail.duskz.shop")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
@@ -84,7 +90,7 @@ def send_key_email(to_email, name, product, key):
     except Exception as e:
         print("[EMAIL ERROR]", e)
 
-# ─── PRODUCTS ────────────────────────────────────────────────────────────────
+# ─── PRODUCTS ──────────────────────────────────────────
 PRODUCT_PRICES = {
     "standard": 799,
     "premium": 1099,
@@ -92,7 +98,12 @@ PRODUCT_PRICES = {
 }
 ALLOWED_PRODUCTS = set(PRODUCT_PRICES.keys())
 
-# ─── KEY ROUTES ───────────────────────────────────────────────────────────────
+# ─── HEALTH CHECK ──────────────────────────────────────
+@app.route("/")
+def home():
+    return {"status": "ok"}
+
+# ─── KEY ROUTES ────────────────────────────────────────
 @app.route("/keys", methods=["GET"])
 def get_keys():
     with get_db() as conn:
@@ -130,6 +141,7 @@ def validate():
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM keys WHERE key=%s", (key,))
             k = cur.fetchone()
+
             if not k or k["status"] == "banned":
                 return jsonify({"valid": False})
 
@@ -147,7 +159,7 @@ def validate():
 
 @app.route("/create-payment-intent", methods=["POST"])
 def create_payment_intent():
-    data = request.json
+    data = request.json or {}
     product = data.get("product")
     email = data.get("email")
     name = data.get("name", "Customer")
@@ -165,6 +177,7 @@ def create_payment_intent():
             "customer_email": email
         }
     )
+
     return jsonify({"clientSecret": intent.client_secret})
 
 @app.route("/stripe-webhook", methods=["POST"])
@@ -190,8 +203,9 @@ def stripe_webhook():
                     LIMIT 1
                 """, (product,))
                 k = cur.fetchone()
+
                 if not k:
-                    return jsonify({"status": "ok"})
+                    return jsonify({"status": "no_keys_available"})
 
                 cur.execute("""
                     UPDATE keys
@@ -204,5 +218,6 @@ def stripe_webhook():
 
     return jsonify({"status": "ok"})
 
+# ─── START ─────────────────────────────────────────────
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
