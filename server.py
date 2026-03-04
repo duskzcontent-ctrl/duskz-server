@@ -18,6 +18,15 @@ stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 
 # ─────────────────────────────────────
+# PRODUCT CATALOG  ← edit prices here
+# ─────────────────────────────────────
+PRODUCTS = {
+    "standard":  {"name": "Duskz Standard",     "amount": 799,  "type": "standard"},
+    "premium":   {"name": "Duskz Premium",       "amount": 1099, "type": "premium"},
+    "crosshair": {"name": "Custom Crosshair ZX", "amount": 199,  "type": "crosshair"},
+}
+
+# ─────────────────────────────────────
 # DB
 # ─────────────────────────────────────
 def get_db():
@@ -34,17 +43,20 @@ def init_db():
                     status TEXT NOT NULL DEFAULT 'unused',
                     hwid TEXT,
                     email TEXT,
+                    buyer_name TEXT,
+                    payment_intent_id TEXT,
                     created TIMESTAMP NOT NULL,
                     sold_at TIMESTAMP
                 )
             """)
-            # Add new columns if upgrading from old schema
-            cur.execute("""
-                ALTER TABLE keys ADD COLUMN IF NOT EXISTS email TEXT;
-            """)
-            cur.execute("""
-                ALTER TABLE keys ADD COLUMN IF NOT EXISTS sold_at TIMESTAMP;
-            """)
+            # Safe migrations — won't error if columns already exist
+            for col, definition in [
+                ("email",             "TEXT"),
+                ("buyer_name",        "TEXT"),
+                ("sold_at",           "TIMESTAMP"),
+                ("payment_intent_id", "TEXT"),
+            ]:
+                cur.execute(f"ALTER TABLE keys ADD COLUMN IF NOT EXISTS {col} {definition};")
         conn.commit()
 
 init_db()
@@ -52,13 +64,17 @@ init_db()
 # ─────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────
-def claim_unused_key(key_type="standard"):
-    """Atomically grab the oldest unused key of a given type and mark it sold."""
+def claim_key(key_type, customer_email, customer_name, payment_intent_id):
+    """Atomically claim the oldest unused key. Safe under concurrent purchases."""
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 UPDATE keys
-                SET status = 'sold', sold_at = %s
+                SET status = 'sold',
+                    sold_at = %s,
+                    email = %s,
+                    buyer_name = %s,
+                    payment_intent_id = %s
                 WHERE key = (
                     SELECT key FROM keys
                     WHERE status = 'unused' AND type = %s
@@ -67,78 +83,105 @@ def claim_unused_key(key_type="standard"):
                     FOR UPDATE SKIP LOCKED
                 )
                 RETURNING key
-            """, (datetime.utcnow(), key_type))
+            """, (datetime.utcnow(), customer_email, customer_name, payment_intent_id, key_type))
             row = cur.fetchone()
         conn.commit()
     return row["key"] if row else None
 
 
-def claim_and_tag_key(key_type, customer_email):
-    """Claim a key and store the buyer's email on it."""
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE keys
-                SET status = 'sold', sold_at = %s, email = %s
-                WHERE key = (
-                    SELECT key FROM keys
-                    WHERE status = 'unused' AND type = %s
-                    ORDER BY created ASC
-                    LIMIT 1
-                    FOR UPDATE SKIP LOCKED
-                )
-                RETURNING key
-            """, (datetime.utcnow(), customer_email, key_type))
-            row = cur.fetchone()
-        conn.commit()
-    return row["key"] if row else None
-
-
-def send_key_email(to_email, key, key_type="standard"):
-    """Send the license key to the buyer via Gmail SMTP."""
+def send_key_email(to_email, buyer_name, key, product_name):
     from_addr = os.environ.get("EMAIL_FROM")
-    user = os.environ.get("EMAIL_USER")
-    password = os.environ.get("EMAIL_PASS")
+    user      = os.environ.get("EMAIL_USER")
+    password  = os.environ.get("EMAIL_PASS")
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = "Your License Key - Thank You!"
-    msg["From"] = from_addr
-    msg["To"] = to_email
+    msg["Subject"] = f"Your {product_name} License Key"
+    msg["From"]    = from_addr
+    msg["To"]      = to_email
 
-    plain = f"""Thank you for your purchase!
+    plain = f"""Hey {buyer_name},
 
-Your {key_type.capitalize()} License Key:
+Thanks for your purchase!
+
+Your {product_name} License Key:
 
   {key}
 
-────────────────────────────────
 HOW TO ACTIVATE:
-1. Open the loader
-2. Enter your license key
-3. Your HWID will be bound on first use
+1. Open the Duskz loader
+2. Enter your license key when prompted
+3. Your HWID will be locked on first use
 
-IMPORTANT: Keep this key safe. It is locked to your hardware once activated.
-If you need your HWID reset, contact support.
-────────────────────────────────
+Keep this key safe — it is bound to your hardware on first activation.
+Need a HWID reset? Join our Discord and open a support ticket.
 
-Thanks for your support!
+— Duskz Team
 """
 
     html = f"""
-<html><body style="font-family:Arial,sans-serif;max-width:600px;margin:auto;padding:20px;">
-  <h2 style="color:#1a1a1a;">Your License Key</h2>
-  <p>Thank you for your purchase! Here is your <strong>{key_type.capitalize()}</strong> license key:</p>
-  <div style="background:#f4f4f4;border:1px solid #ddd;border-radius:6px;padding:16px;font-size:18px;font-family:monospace;letter-spacing:2px;text-align:center;">
-    {key}
-  </div>
-  <h3>How to Activate</h3>
-  <ol>
-    <li>Open the loader</li>
-    <li>Enter your license key above</li>
-    <li>Your hardware ID (HWID) will be bound on first use</li>
-  </ol>
-  <p style="color:#888;font-size:12px;">Keep this key safe — it is locked to your hardware once activated. Need a HWID reset? Contact support.</p>
-</body></html>
+<html>
+<body style="margin:0;padding:0;background:#080808;font-family:'Courier New',monospace;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#080808;padding:40px 20px;">
+    <tr><td align="center">
+      <table width="520" cellpadding="0" cellspacing="0"
+             style="background:#111111;border-radius:12px;border:1px solid rgba(255,255,255,0.1);overflow:hidden;">
+
+        <tr>
+          <td style="padding:32px 36px 24px;border-bottom:1px solid rgba(255,255,255,0.07);">
+            <div style="font-size:22px;font-weight:900;color:#ffffff;letter-spacing:3px;">⚡ DUSKZ</div>
+            <div style="color:#555;font-size:12px;margin-top:4px;">License Delivery</div>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="padding:32px 36px;">
+            <p style="color:#aaa;font-size:14px;margin:0 0 6px;">Hey {buyer_name},</p>
+            <p style="color:#f0f0f0;font-size:16px;font-weight:600;margin:0 0 28px;">
+              Your purchase is confirmed. Here&rsquo;s your key:
+            </p>
+
+            <div style="background:#0d0d0d;border:1px solid rgba(255,255,255,0.12);
+                        border-radius:10px;padding:22px;text-align:center;margin-bottom:28px;">
+              <div style="color:#666;font-size:11px;letter-spacing:2px;
+                          text-transform:uppercase;margin-bottom:10px;">License Key</div>
+              <div style="color:#ffffff;font-size:19px;font-weight:700;
+                          letter-spacing:3px;word-break:break-all;">{key}</div>
+              <div style="color:#555;font-size:11px;margin-top:10px;">{product_name}</div>
+            </div>
+
+            <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
+              <tr><td style="padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.05);">
+                <span style="color:#555;font-size:12px;">Step 1</span>
+                <span style="color:#ccc;font-size:12px;float:right;">Open the Duskz loader</span>
+              </td></tr>
+              <tr><td style="padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.05);">
+                <span style="color:#555;font-size:12px;">Step 2</span>
+                <span style="color:#ccc;font-size:12px;float:right;">Enter your license key</span>
+              </td></tr>
+              <tr><td style="padding:8px 0;">
+                <span style="color:#555;font-size:12px;">Step 3</span>
+                <span style="color:#ccc;font-size:12px;float:right;">HWID locks on first use</span>
+              </td></tr>
+            </table>
+
+            <p style="color:#444;font-size:11px;line-height:1.7;margin:0;">
+              Keep this key safe &mdash; it is bound to your hardware on first activation.<br>
+              Need a HWID reset? Join our Discord and open a support ticket.
+            </p>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="padding:20px 36px;border-top:1px solid rgba(255,255,255,0.07);text-align:center;">
+            <p style="color:#333;font-size:11px;margin:0;">&copy; Duskz &bull; Secured by Stripe</p>
+          </td>
+        </tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>
 """
 
     msg.attach(MIMEText(plain, "plain"))
@@ -149,27 +192,28 @@ Thanks for your support!
         server.sendmail(from_addr, to_email, msg.as_string())
 
 
-def alert_low_stock(key_type):
-    """Send yourself an email when stock is running low."""
+def alert_low_stock(key_type, threshold=5):
     admin_email = os.environ.get("ADMIN_EMAIL") or os.environ.get("EMAIL_FROM")
     if not admin_email:
         return
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) as cnt FROM keys WHERE status='unused' AND type=%s", (key_type,))
-                row = cur.fetchone()
-                count = row["cnt"]
-
-        if count <= 5:
-            send_key_email.__func__ if hasattr(send_key_email, '__func__') else None
+                cur.execute(
+                    "SELECT COUNT(*) as cnt FROM keys WHERE status='unused' AND type=%s",
+                    (key_type,)
+                )
+                count = cur.fetchone()["cnt"]
+        if count <= threshold:
             from_addr = os.environ.get("EMAIL_FROM")
-            user = os.environ.get("EMAIL_USER")
-            password = os.environ.get("EMAIL_PASS")
-            msg = MIMEText(f"WARNING: Only {count} unused '{key_type}' keys remaining in stock. Add more soon!")
-            msg["Subject"] = f"[KEY SYSTEM] Low stock alert: {key_type}"
-            msg["From"] = from_addr
-            msg["To"] = admin_email
+            user      = os.environ.get("EMAIL_USER")
+            password  = os.environ.get("EMAIL_PASS")
+            msg = MIMEText(
+                f"Low stock: only {count} unused '{key_type}' key(s) left. Add more!"
+            )
+            msg["Subject"] = f"[Duskz] Low stock: {key_type} ({count} left)"
+            msg["From"]    = from_addr
+            msg["To"]      = admin_email
             with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
                 server.login(user, password)
                 server.sendmail(from_addr, admin_email, msg.as_string())
@@ -178,30 +222,62 @@ def alert_low_stock(key_type):
 
 
 # ─────────────────────────────────────
-# STRIPE - CREATE PAYMENT INTENT
+# STOCK  — checkout.html calls GET /stock
+# Returns { standard: N, premium: N, crosshair: N }
 # ─────────────────────────────────────
-PRICES = {
-    "standard": 1000,   # $10.00 — edit these
-    "premium":  2500,   # $25.00
-    "lifetime": 5000,   # $50.00
-}
+@app.route("/stock", methods=["GET"])
+def stock():
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT type, COUNT(*) as count
+                FROM keys WHERE status='unused'
+                GROUP BY type
+            """)
+            rows = cur.fetchall()
 
+    counts = {p: 0 for p in PRODUCTS}
+    for row in rows:
+        if row["type"] in counts:
+            counts[row["type"]] = row["count"]
+
+    return jsonify(counts)
+
+
+# ─────────────────────────────────────
+# CREATE PAYMENT INTENT
+# checkout.html sends { product, email, name }
+# ─────────────────────────────────────
 @app.route("/create-payment-intent", methods=["POST"])
 def create_payment_intent():
-    data = request.json or {}
-    key_type = data.get("key_type", "standard")
-    amount = PRICES.get(key_type, 1000)
+    data    = request.json or {}
+    product = data.get("product", "standard")
+    email   = data.get("email", "").strip()
+    name    = data.get("name", "").strip()
+
+    if product not in PRODUCTS:
+        return jsonify({"error": "Invalid product"}), 400
+    if not email or "@" not in email:
+        return jsonify({"error": "Valid email required"}), 400
+
+    p = PRODUCTS[product]
 
     try:
         intent = stripe.PaymentIntent.create(
-            amount=amount,
+            amount=p["amount"],
             currency="usd",
-            metadata={"key_type": key_type},
+            receipt_email=email,
+            metadata={
+                "product":  product,
+                "key_type": p["type"],
+                "email":    email,
+                "name":     name,
+            },
             automatic_payment_methods={"enabled": True},
         )
-        return jsonify(clientSecret=intent.client_secret, amount=amount)
+        return jsonify(clientSecret=intent.client_secret)
     except Exception as e:
-        return jsonify(error=str(e)), 500
+        return jsonify({"error": str(e)}), 500
 
 
 # ─────────────────────────────────────
@@ -209,7 +285,7 @@ def create_payment_intent():
 # ─────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def stripe_webhook():
-    payload = request.get_data()
+    payload    = request.get_data()
     sig_header = request.headers.get("Stripe-Signature")
 
     try:
@@ -222,33 +298,106 @@ def stripe_webhook():
         return jsonify(error="Invalid signature"), 400
 
     if event["type"] == "payment_intent.succeeded":
-        pi = event["data"]["object"]
-        customer_email = pi.get("receipt_email")
-        key_type = pi.get("metadata", {}).get("key_type", "standard")
+        pi             = event["data"]["object"]
+        meta           = pi.get("metadata", {})
+        customer_email = meta.get("email") or pi.get("receipt_email", "")
+        customer_name  = meta.get("name", "Customer")
+        key_type       = meta.get("key_type", "standard")
+        product_slug   = meta.get("product", key_type)
+        pi_id          = pi["id"]
+        product_name   = PRODUCTS.get(product_slug, {}).get("name", "Duskz License")
 
         if not customer_email:
-            print(f"WARNING: No receipt_email on payment_intent {pi['id']}")
+            print(f"WARNING: No email on payment_intent {pi_id}")
             return jsonify(received=True), 200
 
-        key = claim_and_tag_key(key_type, customer_email)
+        # Idempotency — Stripe can fire webhooks more than once
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT key FROM keys WHERE payment_intent_id=%s", (pi_id,)
+                )
+                already_done = cur.fetchone()
+
+        if already_done:
+            print(f"Duplicate webhook {pi_id}, skipping.")
+            return jsonify(received=True), 200
+
+        key = claim_key(key_type, customer_email, customer_name, pi_id)
 
         if key:
             try:
-                send_key_email(customer_email, key, key_type)
+                send_key_email(customer_email, customer_name, key, product_name)
                 alert_low_stock(key_type)
-                print(f"Key {key} sold and emailed to {customer_email}")
+                print(f"[OK] {key} sold to {customer_email} ({product_name})")
             except Exception as e:
-                print(f"Email failed for {customer_email}: {e}")
-                # Key is already claimed — log it so you can resend manually
+                # Key is claimed but email failed — check logs and resend via /resend-key
+                print(f"[EMAIL FAIL] key={key} to={customer_email} err={e}")
         else:
-            print(f"CRITICAL: No unused '{key_type}' keys available! Payment {pi['id']} from {customer_email}")
-            # TODO: refund or alert yourself — add Stripe refund logic here if needed
+            print(f"[CRITICAL] No '{key_type}' keys left! PI={pi_id} buyer={customer_email}")
+            # Uncomment to auto-refund when out of stock:
+            # stripe.Refund.create(payment_intent=pi_id)
 
     return jsonify(received=True), 200
 
 
 # ─────────────────────────────────────
-# GET ALL KEYS
+# ORDER LOOKUP — success.html uses this
+# GET /order/<payment_intent_id>
+# ─────────────────────────────────────
+@app.route("/order/<payment_intent_id>", methods=["GET"])
+def get_order(payment_intent_id):
+    """Returns key info for a given payment intent. Used by success page."""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT key, type, email FROM keys WHERE payment_intent_id=%s",
+                (payment_intent_id,)
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return jsonify({"error": "Order not found"}), 404
+
+    return jsonify({"key": row["key"], "type": row["type"], "email": row["email"]})
+
+
+# ─────────────────────────────────────
+# ADMIN — RESEND KEY EMAIL
+# POST /resend-key  { payment_intent_id: "pi_..." }
+# ─────────────────────────────────────
+@app.route("/resend-key", methods=["POST"])
+def resend_key():
+    data   = request.json or {}
+    pi_id  = data.get("payment_intent_id", "").strip()
+    if not pi_id:
+        return jsonify({"error": "payment_intent_id required"}), 400
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT key, type, email, buyer_name FROM keys WHERE payment_intent_id=%s",
+                (pi_id,)
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return jsonify({"error": "Order not found"}), 404
+
+    product_name = next(
+        (p["name"] for p in PRODUCTS.values() if p["type"] == row["type"]),
+        "Duskz License"
+    )
+
+    try:
+        send_key_email(row["email"], row["buyer_name"] or "Customer", row["key"], product_name)
+        return jsonify({"success": True, "key": row["key"], "sent_to": row["email"]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ─────────────────────────────────────
+# ADMIN — GET ALL KEYS
 # ─────────────────────────────────────
 @app.route("/keys", methods=["GET"])
 def get_keys():
@@ -259,180 +408,135 @@ def get_keys():
 
 
 # ─────────────────────────────────────
-# CREATE KEY
+# ADMIN — CREATE SINGLE KEY
 # ─────────────────────────────────────
 @app.route("/keys", methods=["POST"])
 def create_key():
-    data = request.json or {}
-    key = data.get("key")
+    data  = request.json or {}
+    key   = data.get("key")
     type_ = data.get("type", "standard")
 
     if not key:
         return jsonify({"error": "Key required"}), 400
 
-    record = {
-        "id": str(uuid.uuid4()),
-        "key": key,
-        "type": type_,
-        "status": "unused",
-        "hwid": None,
-        "email": None,
-        "created": datetime.utcnow(),
-        "sold_at": None,
-    }
-
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO keys (id, key, type, status, hwid, email, created, sold_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                INSERT INTO keys
+                    (id, key, type, status, hwid, email, buyer_name, payment_intent_id, created, sold_at)
+                VALUES (%s,%s,%s,'unused',NULL,NULL,NULL,NULL,%s,NULL)
                 ON CONFLICT (key) DO NOTHING
                 RETURNING *
-            """, (
-                record["id"], record["key"], record["type"],
-                record["status"], record["hwid"], record["email"],
-                record["created"], record["sold_at"]
-            ))
+            """, (str(uuid.uuid4()), key, type_, datetime.utcnow()))
             inserted = cur.fetchone()
         conn.commit()
 
     if not inserted:
         return jsonify({"error": "Key already exists"}), 400
-
     return jsonify(inserted)
 
 
 # ─────────────────────────────────────
-# BULK CREATE KEYS
+# ADMIN — BULK GENERATE KEYS
+# POST /keys/bulk  { count: 50, type: "standard" }
 # ─────────────────────────────────────
 @app.route("/keys/bulk", methods=["POST"])
 def bulk_create_keys():
-    """Generate N random keys at once. POST { count: 10, type: 'standard' }"""
-    data = request.json or {}
-    count = min(int(data.get("count", 1)), 100)  # cap at 100
+    data  = request.json or {}
+    count = min(int(data.get("count", 1)), 200)
     type_ = data.get("type", "standard")
 
     created = []
     with get_db() as conn:
         with conn.cursor() as cur:
             for _ in range(count):
-                new_key = str(uuid.uuid4()).replace("-", "").upper()[:24]
-                new_key = f"{new_key[:6]}-{new_key[6:12]}-{new_key[12:18]}-{new_key[18:24]}"
-                try:
-                    cur.execute("""
-                        INSERT INTO keys (id, key, type, status, hwid, email, created, sold_at)
-                        VALUES (%s,%s,%s,'unused',NULL,NULL,%s,NULL)
-                        ON CONFLICT (key) DO NOTHING
-                        RETURNING *
-                    """, (str(uuid.uuid4()), new_key, type_, datetime.utcnow()))
-                    row = cur.fetchone()
-                    if row:
-                        created.append(row)
-                except Exception:
-                    pass
+                raw     = uuid.uuid4().hex.upper()
+                new_key = f"{raw[0:6]}-{raw[6:12]}-{raw[12:18]}-{raw[18:24]}"
+                cur.execute("""
+                    INSERT INTO keys
+                        (id, key, type, status, hwid, email, buyer_name, payment_intent_id, created, sold_at)
+                    VALUES (%s,%s,%s,'unused',NULL,NULL,NULL,NULL,%s,NULL)
+                    ON CONFLICT (key) DO NOTHING
+                    RETURNING *
+                """, (str(uuid.uuid4()), new_key, type_, datetime.utcnow()))
+                row = cur.fetchone()
+                if row:
+                    created.append(row)
         conn.commit()
 
     return jsonify({"created": len(created), "keys": created})
 
 
 # ─────────────────────────────────────
-# STOCK COUNT
-# ─────────────────────────────────────
-@app.route("/keys/stock", methods=["GET"])
-def stock_count():
-    """Returns unused key counts per type."""
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT type, COUNT(*) as available
-                FROM keys WHERE status='unused'
-                GROUP BY type
-            """)
-            return jsonify(cur.fetchall())
-
-
-# ─────────────────────────────────────
-# RESET HWID
+# ADMIN — RESET HWID
 # ─────────────────────────────────────
 @app.route("/keys/<key>/reset-hwid", methods=["POST"])
 def reset_hwid(key):
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE keys SET hwid=NULL, status='sold'
-                WHERE key=%s RETURNING *
-            """, (key,))
+            cur.execute(
+                "UPDATE keys SET hwid=NULL, status='sold' WHERE key=%s RETURNING *", (key,)
+            )
             updated = cur.fetchone()
         conn.commit()
-
     if not updated:
         return jsonify({"error": "Key not found"}), 404
     return jsonify(updated)
 
 
 # ─────────────────────────────────────
-# BAN
+# ADMIN — BAN / UNBAN
 # ─────────────────────────────────────
 @app.route("/keys/<key>/ban", methods=["POST"])
 def ban_key(key):
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE keys SET status='banned'
-                WHERE key=%s RETURNING *
-            """, (key,))
+            cur.execute(
+                "UPDATE keys SET status='banned' WHERE key=%s RETURNING *", (key,)
+            )
             updated = cur.fetchone()
         conn.commit()
-
     if not updated:
         return jsonify({"error": "Key not found"}), 404
     return jsonify(updated)
 
 
-# ─────────────────────────────────────
-# UNBAN
-# ─────────────────────────────────────
 @app.route("/keys/<key>/unban", methods=["POST"])
 def unban_key(key):
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE keys SET status='unused'
-                WHERE key=%s RETURNING *
-            """, (key,))
+            cur.execute(
+                "UPDATE keys SET status='unused' WHERE key=%s RETURNING *", (key,)
+            )
             updated = cur.fetchone()
         conn.commit()
-
     if not updated:
         return jsonify({"error": "Key not found"}), 404
     return jsonify(updated)
 
 
 # ─────────────────────────────────────
-# DELETE
+# ADMIN — DELETE KEY
 # ─────────────────────────────────────
 @app.route("/keys/<key>", methods=["DELETE"])
 def delete_key(key):
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                DELETE FROM keys WHERE key=%s RETURNING *
-            """, (key,))
+            cur.execute("DELETE FROM keys WHERE key=%s RETURNING *", (key,))
             deleted = cur.fetchone()
         conn.commit()
-
     if not deleted:
         return jsonify({"error": "Key not found"}), 404
     return jsonify({"success": True})
 
 
 # ─────────────────────────────────────
-# VALIDATE KEY (called by C++ loader)
+# VALIDATE KEY  (called by C++ loader)
 # ─────────────────────────────────────
 @app.route("/validate", methods=["POST"])
 def validate_key():
     data = request.json or {}
-    key = data.get("key")
+    key  = data.get("key")
     hwid = data.get("hwid")
 
     if not key or not hwid:
@@ -449,19 +553,8 @@ def validate_key():
     if record["status"] == "banned":
         return jsonify({"valid": False, "error": "Key is banned"})
 
-    # Key was sold but never activated — bind HWID now
-    if record["status"] == "sold" and record["hwid"] is None:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE keys SET hwid=%s, status='active' WHERE key=%s",
-                    (hwid, key)
-                )
-            conn.commit()
-        return jsonify({"valid": True, "type": record["type"]})
-
-    # Legacy: unused key (manually created, not sold via Stripe)
-    if record["status"] == "unused" and record["hwid"] is None:
+    # First activation — bind HWID
+    if record["status"] in ("sold", "unused") and record["hwid"] is None:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -476,7 +569,7 @@ def validate_key():
             return jsonify({"valid": False, "error": "HWID mismatch"})
         return jsonify({"valid": True, "type": record["type"]})
 
-    return jsonify({"valid": False, "error": "Key not eligible for activation"})
+    return jsonify({"valid": False, "error": "Key not eligible"})
 
 
 # ─────────────────────────────────────
