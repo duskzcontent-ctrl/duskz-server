@@ -1,0 +1,8 @@
+[phases.setup]
+nixPkgs = ["python311"]
+
+[phases.install]
+cmds = ["pip install flask flask-cors psycopg2-binary stripe"]
+
+[start]
+cmd = "python server.py"
