@@ -64,9 +64,14 @@ def init_db():
                     claimed BOOLEAN NOT NULL DEFAULT FALSE,
                     status TEXT NOT NULL DEFAULT 'unclaimed',
                     buyer_email TEXT,
+                    buyer_name TEXT,
                     payment_intent_id TEXT,
                     created_at TIMESTAMP NOT NULL
                 )
+            """)
+            # Add buyer_name column if it doesn't exist yet (for existing deployments)
+            cur.execute("""
+                ALTER TABLE accounts ADD COLUMN IF NOT EXISTS buyer_name TEXT
             """)
         conn.commit()
 
@@ -238,6 +243,7 @@ def stripe_webhook():
                             SET claimed = TRUE,
                                 status = 'claimed',
                                 buyer_email = %s,
+                                buyer_name = %s,
                                 payment_intent_id = %s
                             WHERE id = (
                                 SELECT id FROM accounts
@@ -247,7 +253,7 @@ def stripe_webhook():
                                 FOR UPDATE SKIP LOCKED
                             )
                             RETURNING account
-                        """, (email, pi_id))
+                        """, (email, name, pi_id))
                         row = cur.fetchone()
                     conn.commit()
 
@@ -471,20 +477,55 @@ def delete_account(acc_id):
     return jsonify({"deleted": True})
 
 # ─────────────────────────────────────
-# SUCCESS PAGE HELPER
+# ORDER LOOKUP  ← success.html calls GET /order/<payment_intent_id>
 # ─────────────────────────────────────
+@app.route("/order/<path:pi_id>", methods=["GET"])
+def get_order(pi_id):
+    """
+    Polled by success.html after payment. Returns the delivered key/account
+    so it can be shown on screen. Returns 202 while webhook is still pending.
+    """
+    pi_id = pi_id.strip()
+    if not pi_id:
+        return jsonify({"error": "Missing payment_intent"}), 400
+
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                # Check roblox accounts first
+                cur.execute(
+                    "SELECT account AS key, buyer_email AS email, type FROM accounts WHERE payment_intent_id=%s AND claimed=TRUE LIMIT 1",
+                    (pi_id,)
+                )
+                row = cur.fetchone()
+
+                if not row:
+                    # Check license keys
+                    cur.execute(
+                        "SELECT key, email, type FROM keys WHERE payment_intent_id=%s LIMIT 1",
+                        (pi_id,)
+                    )
+                    row = cur.fetchone()
+
+        if row:
+            return jsonify({"key": row["key"], "email": row["email"], "type": row["type"]})
+
+        # Webhook hasn't fired yet — tell success.html to keep retrying
+        return jsonify({"status": "pending"}), 202
+
+    except Exception as e:
+        print(f"[ORDER] DB error: {e}")
+        return jsonify({"error": "Database error"}), 500
+
+
+# Keep old endpoint alive in case anything else uses it
 @app.route("/order-details", methods=["GET"])
-def order_details():
-    """
-    Called by success.html to show the buyer what they purchased.
-    Returns the delivered account/key if the PI is found.
-    """
+def order_details_legacy():
     pi_id = request.args.get("payment_intent", "").strip()
     if not pi_id:
         return jsonify({"error": "Missing payment_intent"}), 400
     with get_db() as conn:
         with conn.cursor() as cur:
-            # Check accounts first
             cur.execute(
                 "SELECT account, type FROM accounts WHERE payment_intent_id=%s AND claimed=TRUE",
                 (pi_id,)
@@ -497,7 +538,6 @@ def order_details():
                     "username": parts[0],
                     "password": parts[1] if len(parts) > 1 else ""
                 })
-            # Check keys
             cur.execute(
                 "SELECT key, type FROM keys WHERE payment_intent_id=%s",
                 (pi_id,)
