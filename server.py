@@ -30,7 +30,8 @@ PRODUCTS = {
     "standard":  {"name": "Duskz Standard",       "amount": 799,  "type": "standard"},
     "premium":   {"name": "Duskz Premium",         "amount": 1099, "type": "premium"},
     "crosshair": {"name": "Custom Crosshair ZX",   "amount": 199,  "type": "crosshair"},
-    "roblox":    {"name": "Roblox Alt Account",    "amount": 299,  "type": "roblox"},
+    "roblox":    {"name": "Roblox 200 Robux Alt",  "amount": 299,  "type": "roblox"},
+    "roblox1k":  {"name": "Roblox 1K Robux Alt",   "amount": 1250, "type": "roblox1k"},
 }
 
 # ─────────────────────────────────────
@@ -69,7 +70,6 @@ def init_db():
                     created_at TIMESTAMP NOT NULL
                 )
             """)
-            # Add buyer_name column if it doesn't exist yet (for existing deployments)
             cur.execute("""
                 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS buyer_name TEXT
             """)
@@ -81,7 +81,6 @@ init_db()
 # EMAIL HELPER
 # ─────────────────────────────────────
 def send_email(to_email, subject, html_body):
-    """Send an email via SMTP. Returns True on success, False on failure."""
     if not SMTP_USER or not SMTP_PASSWORD:
         print(f"[EMAIL] SMTP not configured — would have sent to {to_email}: {subject}")
         return False
@@ -102,17 +101,17 @@ def send_email(to_email, subject, html_body):
         print(f"[EMAIL] Failed to send to {to_email}: {e}")
         return False
 
-def send_roblox_account_email(to_email, buyer_name, account_str):
+def send_roblox_account_email(to_email, buyer_name, account_str, robux_amount="200"):
     parts    = account_str.split(":", 1)
     username = parts[0] if len(parts) > 0 else "N/A"
     password = parts[1] if len(parts) > 1 else "N/A"
-    subject  = "Your Duskz Roblox Account — Order Confirmed"
+    subject  = f"Your Duskz Roblox {robux_amount} Robux Account — Order Confirmed"
     html     = f"""
     <div style="background:#070709;color:#d8d8e0;font-family:sans-serif;padding:40px;max-width:520px;margin:auto;border-radius:12px;border:1px solid rgba(255,255,255,0.08)">
       <h2 style="color:#ffffff;letter-spacing:-1px;margin-bottom:6px">Your order is ready ✓</h2>
       <p style="color:#7a7a8a;font-size:14px;margin-bottom:28px">Hi {buyer_name}, here are your account details.</p>
       <div style="background:#111116;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:20px;margin-bottom:20px">
-        <p style="font-size:12px;color:#4a4a58;text-transform:uppercase;letter-spacing:2px;margin-bottom:12px">Roblox Account</p>
+        <p style="font-size:12px;color:#4a4a58;text-transform:uppercase;letter-spacing:2px;margin-bottom:12px">Roblox Account — {robux_amount} Robux</p>
         <p style="margin-bottom:8px"><span style="color:#7a7a8a;font-size:13px">Username: </span><strong style="color:#ffffff;font-size:15px">{username}</strong></p>
         <p><span style="color:#7a7a8a;font-size:13px">Password: </span><strong style="color:#ffffff;font-size:15px">{password}</strong></p>
       </div>
@@ -143,7 +142,7 @@ def send_crosshair_email(to_email, buyer_name, license_key):
     return send_email(to_email, subject, html)
 
 # ─────────────────────────────────────
-# STOCK ENDPOINT  ← was missing, causes /stock 404
+# STOCK ENDPOINT
 # ─────────────────────────────────────
 @app.route("/stock", methods=["GET"])
 def get_stock():
@@ -155,10 +154,17 @@ def get_stock():
                 )
                 row = cur.fetchone()
                 roblox_count = row["cnt"] if row else 0
-        return jsonify({"roblox": roblox_count})
+
+                cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM accounts WHERE claimed = FALSE AND status = 'unclaimed' AND type = 'roblox1k'"
+                )
+                row = cur.fetchone()
+                roblox1k_count = row["cnt"] if row else 0
+
+        return jsonify({"roblox": roblox_count, "roblox1k": roblox1k_count})
     except Exception as e:
         print(f"[STOCK] Error: {e}")
-        return jsonify({"roblox": 0})
+        return jsonify({"roblox": 0, "roblox1k": 0})
 
 # ─────────────────────────────────────
 # CREATE PAYMENT INTENT
@@ -175,14 +181,15 @@ def create_payment_intent():
     if not email or "@" not in email:
         return jsonify({"error": "Valid email required"}), 400
 
-    # FIX: For roblox orders, reject immediately if out of stock
-    # so buyer isn't charged when there's nothing to deliver.
-    if product == "roblox":
+    # Pre-flight stock check for account products
+    if product in ("roblox", "roblox1k"):
+        acc_type = PRODUCTS[product]["type"]
         try:
             with get_db() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT id FROM accounts WHERE claimed = FALSE AND status = 'unclaimed' AND type = 'roblox' LIMIT 1"
+                        "SELECT id FROM accounts WHERE claimed = FALSE AND status = 'unclaimed' AND type = %s LIMIT 1",
+                        (acc_type,)
                     )
                     if not cur.fetchone():
                         return jsonify({"error": "Out of stock — check back soon!"}), 400
@@ -232,12 +239,13 @@ def stripe_webhook():
             print(f"[WEBHOOK] Missing metadata on PaymentIntent {pi_id}")
             return jsonify({"received": True})
 
-        # ── ROBLOX ACCOUNT DELIVERY ────────────────────────────
-        if product == "roblox":
+        # ── ROBLOX ACCOUNT DELIVERY (200 or 1K) ───────────────
+        if product in ("roblox", "roblox1k"):
+            acc_type     = PRODUCTS[product]["type"]
+            robux_label  = "1,000" if product == "roblox1k" else "200"
             try:
                 with get_db() as conn:
                     with conn.cursor() as cur:
-                        # Atomically claim one unclaimed account
                         cur.execute("""
                             UPDATE accounts
                             SET claimed = TRUE,
@@ -247,23 +255,21 @@ def stripe_webhook():
                                 payment_intent_id = %s
                             WHERE id = (
                                 SELECT id FROM accounts
-                                WHERE claimed = FALSE AND status = 'unclaimed' AND type = 'roblox'
+                                WHERE claimed = FALSE AND status = 'unclaimed' AND type = %s
                                 ORDER BY created_at ASC
                                 LIMIT 1
                                 FOR UPDATE SKIP LOCKED
                             )
                             RETURNING account
-                        """, (email, name, pi_id))
+                        """, (email, name, pi_id, acc_type))
                         row = cur.fetchone()
                     conn.commit()
 
                 if row:
-                    send_roblox_account_email(email, name, row["account"])
-                    print(f"[WEBHOOK] Roblox account delivered to {email}")
+                    send_roblox_account_email(email, name, row["account"], robux_label)
+                    print(f"[WEBHOOK] Roblox {robux_label} Robux account delivered to {email}")
                 else:
-                    # Out of stock after payment — flag for manual review
-                    print(f"[WEBHOOK] WARNING: No roblox accounts left for {email} (PI: {pi_id})")
-                    # Send a "we'll sort this out" email
+                    print(f"[WEBHOOK] WARNING: No {acc_type} accounts left for {email} (PI: {pi_id})")
                     send_email(
                         email,
                         "Duskz — Action Required on Your Order",
@@ -282,7 +288,6 @@ def stripe_webhook():
             try:
                 with get_db() as conn:
                     with conn.cursor() as cur:
-                        # Find an unused key of the right type
                         key_type = PRODUCTS[product]["type"]
                         cur.execute("""
                             UPDATE keys
@@ -448,7 +453,7 @@ def list_accounts():
 def add_accounts():
     data     = request.json or {}
     lines    = data.get("accounts", [])
-    acc_type = data.get("type", "roblox")
+    acc_type = data.get("type", "roblox")  # pass "roblox1k" for 1K accounts
     if not lines:
         return jsonify({"error": "No accounts provided"}), 400
     added = 0
@@ -477,14 +482,10 @@ def delete_account(acc_id):
     return jsonify({"deleted": True})
 
 # ─────────────────────────────────────
-# ORDER LOOKUP  ← success.html calls GET /order/<payment_intent_id>
+# ORDER LOOKUP
 # ─────────────────────────────────────
 @app.route("/order/<path:pi_id>", methods=["GET"])
 def get_order(pi_id):
-    """
-    Polled by success.html after payment. Returns the delivered key/account
-    so it can be shown on screen. Returns 202 while webhook is still pending.
-    """
     pi_id = pi_id.strip()
     if not pi_id:
         return jsonify({"error": "Missing payment_intent"}), 400
@@ -492,7 +493,6 @@ def get_order(pi_id):
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
-                # Check roblox accounts first
                 cur.execute(
                     "SELECT account AS key, buyer_email AS email, type FROM accounts WHERE payment_intent_id=%s AND claimed=TRUE LIMIT 1",
                     (pi_id,)
@@ -500,7 +500,6 @@ def get_order(pi_id):
                 row = cur.fetchone()
 
                 if not row:
-                    # Check license keys
                     cur.execute(
                         "SELECT key, email, type FROM keys WHERE payment_intent_id=%s LIMIT 1",
                         (pi_id,)
@@ -510,7 +509,6 @@ def get_order(pi_id):
         if row:
             return jsonify({"key": row["key"], "email": row["email"], "type": row["type"]})
 
-        # Webhook hasn't fired yet — tell success.html to keep retrying
         return jsonify({"status": "pending"}), 202
 
     except Exception as e:
@@ -518,7 +516,6 @@ def get_order(pi_id):
         return jsonify({"error": "Database error"}), 500
 
 
-# Keep old endpoint alive in case anything else uses it
 @app.route("/order-details", methods=["GET"])
 def order_details_legacy():
     pi_id = request.args.get("payment_intent", "").strip()
